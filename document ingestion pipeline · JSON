@@ -1,0 +1,278 @@
+{
+  "name": " Multi-Modal Research Assistant — Document Ingestion Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 30 }]
+        }
+      },
+      "id": "node_schedule_trigger",
+      "name": " Schedule Trigger (Every 30 min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [80, 300]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "upload-document",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "node_webhook_upload",
+      "name": "🔗 Webhook: Manual Upload Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [80, 500],
+      "webhookId": "research-assistant-upload"
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "list",
+        "driveId": { "mode": "list", "value": "MyDrive" },
+        "folderId": { "mode": "list", "value": "YOUR_RESEARCH_FOLDER_ID" },
+        "filter": {
+          "modifiedAfter": "={{ $now.minus(30, 'minutes').toISO() }}"
+        },
+        "options": { "fields": "id,name,mimeType,modifiedTime,size,webViewLink" }
+      },
+      "id": "node_gdrive_list",
+      "name": " Google Drive: List New Files",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [320, 300],
+      "credentials": { "googleDriveOAuth2Api": { "id": "gdrive_creds", "name": "Google Drive OAuth2" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false },
+          "conditions": [
+            {
+              "id": "mime_type_check",
+              "leftValue": "={{ $json.mimeType }}",
+              "rightValue": "application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/markdown,image/png,image/jpeg",
+              "operator": { "type": "string", "operation": "contains" }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "node_filter_filetypes",
+      "name": "🔍 Filter: Supported File Types",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [560, 300]
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "download",
+        "fileId": { "value": "={{ $json.id }}", "mode": "expression" },
+        "options": { "googleFileConversion": { "exportGoogleFormats": { "docsToFormat": "text/plain" } } }
+      },
+      "id": "node_gdrive_download",
+      "name": " Google Drive: Download File",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [800, 300],
+      "credentials": { "googleDriveOAuth2Api": { "id": "gdrive_creds", "name": "Google Drive OAuth2" } }
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "data",
+        "options": { "joinPages": true }
+      },
+      "id": "node_extract_from_file",
+      "name": " Extract Text From File",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [1040, 200]
+    },
+    {
+      "parameters": {
+        "resource": "image",
+        "operation": "analyze",
+        "modelId": { "value": "gpt-4o", "mode": "list" },
+        "messages": {
+          "messageValues": [
+            {
+              "role": "user",
+              "contentType": "multipart",
+              "contentParts": {
+                "contentPartValues": [
+                  {
+                    "type": "text",
+                    "text": "You are a research document analyzer. Extract ALL text content, tables, data, charts, figures, and their descriptions from this document image. Provide structured output with: 1) Main text content 2) Table data as markdown tables 3) Chart/figure descriptions 4) Key entities (people, dates, locations, organizations) 5) Main topics and themes. Be comprehensive and precise."
+                  },
+                  {
+                    "type": "imageBinary",
+                    "binaryProperty": "data"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node_vision_analysis",
+      "name": "👁️ GPT-4o Vision: Analyze Images",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [1040, 400],
+      "credentials": { "openAiApi": { "id": "openai_creds", "name": "OpenAI API" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const text = item.json.text || item.json.message?.content || '';\n  const fileName = item.json.name || 'unknown';\n  const fileId = item.json.id || '';\n  const mimeType = item.json.mimeType || '';\n  const modifiedTime = item.json.modifiedTime || new Date().toISOString();\n  const webViewLink = item.json.webViewLink || '';\n  \n  // Smart chunking: preserve semantic boundaries\n  const MAX_CHUNK = 1200;\n  const OVERLAP = 150;\n  \n  const sentences = text.match(/[^.!?\\n]+[.!?\\n]+/g) || [text];\n  const chunks = [];\n  let current = '';\n  let chunkIndex = 0;\n  \n  for (const sentence of sentences) {\n    if ((current + sentence).length > MAX_CHUNK && current.length > 0) {\n      chunks.push({\n        chunkIndex,\n        text: current.trim(),\n        charCount: current.trim().length\n      });\n      // Overlap: keep last portion\n      const words = current.split(' ');\n      current = words.slice(-Math.floor(OVERLAP/5)).join(' ') + ' ' + sentence;\n      chunkIndex++;\n    } else {\n      current += sentence + ' ';\n    }\n  }\n  \n  if (current.trim()) {\n    chunks.push({ chunkIndex, text: current.trim(), charCount: current.trim().length });\n  }\n  \n  // Emit each chunk as separate item\n  for (const chunk of chunks) {\n    results.push({\n      json: {\n        chunkId: `${fileId}_chunk_${chunk.chunkIndex}`,\n        fileId,\n        fileName,\n        mimeType,\n        modifiedTime,\n        webViewLink,\n        chunkIndex: chunk.chunkIndex,\n        totalChunks: chunks.length,\n        text: chunk.text,\n        charCount: chunk.charCount,\n        processedAt: new Date().toISOString()\n      }\n    });\n  }\n}\n\nreturn results;"
+      },
+      "id": "node_smart_chunker",
+      "name": "✂️ Smart Semantic Chunker",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1280, 300]
+    },
+    {
+      "parameters": {
+        "model": "text-embedding-3-large",
+        "input": "={{ $json.text }}",
+        "options": { "dimensions": 3072 }
+      },
+      "id": "node_openai_embed",
+      "name": " OpenAI: Generate Embeddings (3072-dim)",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOpenAi",
+      "typeVersion": 1.2,
+      "position": [1520, 300],
+      "credentials": { "openAiApi": { "id": "openai_creds", "name": "OpenAI API" } }
+    },
+    {
+      "parameters": {
+        "resource": "index",
+        "operation": "upsert",
+        "indexName": "research-assistant-v2",
+        "namespace": "={{ $json.mimeType.includes('image') ? 'images' : 'documents' }}",
+        "vectors": {
+          "vectorValues": [
+            {
+              "id": "={{ $json.chunkId }}",
+              "values": "={{ $json.embedding }}",
+              "metadata": {
+                "metadataValues": [
+                  { "name": "fileId", "value": "={{ $json.fileId }}" },
+                  { "name": "fileName", "value": "={{ $json.fileName }}" },
+                  { "name": "chunkIndex", "value": "={{ $json.chunkIndex }}" },
+                  { "name": "totalChunks", "value": "={{ $json.totalChunks }}" },
+                  { "name": "text", "value": "={{ $json.text }}" },
+                  { "name": "mimeType", "value": "={{ $json.mimeType }}" },
+                  { "name": "modifiedTime", "value": "={{ $json.modifiedTime }}" },
+                  { "name": "webViewLink", "value": "={{ $json.webViewLink }}" },
+                  { "name": "processedAt", "value": "={{ $json.processedAt }}" },
+                  { "name": "charCount", "value": "={{ $json.charCount }}" }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "id": "node_pinecone_upsert",
+      "name": " Pinecone: Upsert Vectors",
+      "type": "@n8n/n8n-nodes-langchain.vectorStorePinecone",
+      "typeVersion": 1.1,
+      "position": [1760, 300],
+      "credentials": { "pineconeApi": { "id": "pinecone_creds", "name": "Pinecone API" } }
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "upsert",
+        "schema": { "value": "public", "mode": "list" },
+        "table": { "value": "document_registry", "mode": "list" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "file_id": "={{ $json.fileId }}",
+            "file_name": "={{ $json.fileName }}",
+            "mime_type": "={{ $json.mimeType }}",
+            "total_chunks": "={{ $json.totalChunks }}",
+            "modified_time": "={{ $json.modifiedTime }}",
+            "web_view_link": "={{ $json.webViewLink }}",
+            "processed_at": "={{ $json.processedAt }}",
+            "status": "active"
+          },
+          "matchingColumns": ["file_id"]
+        }
+      },
+      "id": "node_postgres_registry",
+      "name": " PostgreSQL: Update Document Registry",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1760, 500],
+      "credentials": { "postgres": { "id": "postgres_creds", "name": "PostgreSQL DB" } }
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": " *Research Assistant*: Processed `{{ $json.fileName }}`\n\n📊 *Stats:*\n• Chunks created: {{ $json.totalChunks }}\n• Characters: {{ $json.charCount }}\n• Type: {{ $json.mimeType }}\n• Time: {{ $now.format('HH:mm') }}\n\n🔗 [View File]({{ $json.webViewLink }})",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "node_telegram_notify",
+      "name": "Telegram: Notify on Completion",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2000, 300],
+      "credentials": { "telegramApi": { "id": "telegram_creds", "name": "Telegram Bot" } }
+    },
+    {
+      "parameters": {
+        "subject": "Research Assistant: Processing Report",
+        "emailType": "html",
+        "message": "<h2> Document Processing Complete</h2><p>File: <strong>{{ $json.fileName }}</strong></p><p>Chunks: {{ $json.totalChunks }}</p><p>Status: ✅ Success</p>",
+        "options": {}
+      },
+      "id": "node_email_report",
+      "name": "📧 Gmail: Send Processing Report",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2000, 500],
+      "credentials": { "gmailOAuth2": { "id": "gmail_creds", "name": "Gmail OAuth2" } }
+    }
+  ],
+  "connections": {
+    " Schedule Trigger (Every 30 min)": { "main": [[{ "node": " Google Drive: List New Files", "type": "main", "index": 0 }]] },
+    " Webhook: Manual Upload Trigger": { "main": [[{ "node": " Google Drive: List New Files", "type": "main", "index": 0 }]] },
+    " Google Drive: List New Files": { "main": [[{ "node": " Filter: Supported File Types", "type": "main", "index": 0 }]] },
+    " Filter: Supported File Types": { "main": [[{ "node": "Google Drive: Download File", "type": "main", "index": 0 }]] },
+    " Google Drive: Download File": {
+      "main": [[
+        { "node": "📄 Extract Text From File", "type": "main", "index": 0 },
+        { "node": "👁️ GPT-4o Vision: Analyze Images", "type": "main", "index": 0 }
+      ]]
+    },
+    " Extract Text From File": { "main": [[{ "node": "✂️ Smart Semantic Chunker", "type": "main", "index": 0 }]] },
+    " GPT-4o Vision: Analyze Images": { "main": [[{ "node": " Smart Semantic Chunker", "type": "main", "index": 0 }]] },
+    " Smart Semantic Chunker": { "main": [[{ "node": " OpenAI: Generate Embeddings (3072-dim)", "type": "main", "index": 0 }]] },
+    " OpenAI: Generate Embeddings (3072-dim)": { "main": [[{ "node": "Pinecone: Upsert Vectors", "type": "main", "index": 0 }]] },
+    " Pinecone: Upsert Vectors": {
+      "main": [[
+        { "node": " PostgreSQL: Update Document Registry", "type": "main", "index": 0 },
+        { "node": " Telegram: Notify on Completion", "type": "main", "index": 0 },
+        { "node": " Gmail: Send Processing Report", "type": "main", "index": 0 }
+      ]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromAList",
+    "errorWorkflow": "error_handler_workflow"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "n8nVersion": "1.70.0"
+  }
+}
