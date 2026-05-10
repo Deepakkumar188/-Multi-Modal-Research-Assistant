@@ -1,0 +1,144 @@
+-- ============================================================
+-- Multi-Modal Research Assistant — PostgreSQL Database Schema
+-- ============================================================
+
+-- Enable required extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm"; -- For fuzzy text search
+
+-- ============================================================
+-- Document Registry
+-- ============================================================
+CREATE TABLE IF NOT EXISTS document_registry (
+    id              UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    file_id         VARCHAR(255) UNIQUE NOT NULL,
+    file_name       VARCHAR(500) NOT NULL,
+    mime_type       VARCHAR(100),
+    total_chunks    INTEGER DEFAULT 0,
+    char_count      INTEGER DEFAULT 0,
+    modified_time   TIMESTAMPTZ,
+    web_view_link   TEXT,
+    processed_at    TIMESTAMPTZ DEFAULT NOW(),
+    status          VARCHAR(50) DEFAULT 'active' CHECK (status IN ('active', 'deleted', 'processing', 'error')),
+    tags            TEXT[],
+    metadata        JSONB DEFAULT '{}'::JSONB,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_doc_status ON document_registry(status);
+CREATE INDEX idx_doc_processed_at ON document_registry(processed_at DESC);
+CREATE INDEX idx_doc_file_name_trgm ON document_registry USING gin(file_name gin_trgm_ops);
+
+-- ============================================================
+-- Chat Sessions
+-- ============================================================
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id              UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    session_id      VARCHAR(255) UNIQUE NOT NULL,
+    user_id         VARCHAR(255) DEFAULT 'anonymous',
+    mode            VARCHAR(50) DEFAULT 'research',
+    last_message    TEXT,
+    last_response   TEXT,
+    message_count   INTEGER DEFAULT 0,
+    total_tokens    INTEGER DEFAULT 0,
+    documents_cited INTEGER DEFAULT 0,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_session_user ON chat_sessions(user_id);
+CREATE INDEX idx_session_updated ON chat_sessions(updated_at DESC);
+
+-- ============================================================
+-- Chat Messages (Full history)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id              UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    session_id      VARCHAR(255) REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
+    role            VARCHAR(20) NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content         TEXT NOT NULL,
+    sources         JSONB DEFAULT '[]'::JSONB,
+    processing_ms   INTEGER,
+    model           VARCHAR(100),
+    tokens_used     INTEGER,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_msg_session ON chat_messages(session_id, created_at DESC);
+
+-- ============================================================
+-- Analytics Logs
+-- ============================================================
+CREATE TABLE IF NOT EXISTS analytics_logs (
+    id              UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    report_time     TIMESTAMPTZ NOT NULL,
+    total_sessions  INTEGER DEFAULT 0,
+    unique_users    INTEGER DEFAULT 0,
+    total_messages  INTEGER DEFAULT 0,
+    total_documents INTEGER DEFAULT 0,
+    total_chunks    INTEGER DEFAULT 0,
+    pinecone_vectors BIGINT DEFAULT 0,
+    system_status   VARCHAR(50) DEFAULT 'healthy',
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_analytics_time ON analytics_logs(report_time DESC);
+
+-- ============================================================
+-- Feedback & Ratings
+-- ============================================================
+CREATE TABLE IF NOT EXISTS message_feedback (
+    id              UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    message_id      UUID REFERENCES chat_messages(id) ON DELETE CASCADE,
+    session_id      VARCHAR(255),
+    rating          SMALLINT CHECK (rating BETWEEN 1 AND 5),
+    helpful         BOOLEAN,
+    comment         TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ============================================================
+-- Trigger: Auto-update updated_at
+-- ============================================================
+CREATE OR REPLACE FUNCTION update_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_doc_updated
+    BEFORE UPDATE ON document_registry
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+CREATE TRIGGER trg_session_updated
+    BEFORE UPDATE ON chat_sessions
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- ============================================================
+-- Useful Views
+-- ============================================================
+CREATE OR REPLACE VIEW v_daily_stats AS
+SELECT
+    DATE(created_at) as date,
+    COUNT(DISTINCT session_id) as sessions,
+    COUNT(DISTINCT CASE WHEN role='user' THEN id END) as user_messages,
+    COUNT(DISTINCT CASE WHEN role='assistant' THEN id END) as ai_responses,
+    AVG(processing_ms) FILTER (WHERE role='assistant') as avg_response_ms
+FROM chat_messages
+GROUP BY DATE(created_at)
+ORDER BY date DESC;
+
+CREATE OR REPLACE VIEW v_document_summary AS
+SELECT
+    dr.file_name,
+    dr.mime_type,
+    dr.total_chunks,
+    dr.status,
+    dr.processed_at,
+    dr.web_view_link
+FROM document_registry dr
+WHERE dr.status = 'active'
+ORDER BY dr.processed_at DESC;
