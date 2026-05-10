@@ -1,0 +1,240 @@
+{
+  "name": " Multi-Modal Research Assistant — AI Agent Chat Engine",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "research-chat",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*",
+          "responseHeaders": {
+            "entries": [
+              { "name": "Access-Control-Allow-Origin", "value": "*" },
+              { "name": "Content-Type", "value": "application/json" }
+            ]
+          }
+        }
+      },
+      "id": "node_chat_webhook",
+      "name": " Webhook: Receive Chat Message",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [80, 400],
+      "webhookId": "research-chat-engine"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst sessionId = body.sessionId || `session_${Date.now()}`;\nconst userMessage = body.message || body.query || '';\nconst userId = body.userId || 'anonymous';\nconst mode = body.mode || 'research'; // research | summarize | compare | extract\nconst filters = body.filters || {}; // fileType, dateRange, tags\n\nreturn [{\n  json: {\n    sessionId,\n    userMessage,\n    userId,\n    mode,\n    filters,\n    timestamp: new Date().toISOString(),\n    requestId: `req_${Math.random().toString(36).substr(2,9)}`\n  }\n}];"
+      },
+      "id": "node_parse_request",
+      "name": " Parse & Validate Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [320, 400]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "options": {
+          "systemMessage": "You are an elite AI Research Assistant with access to a curated knowledge base of research documents. Your capabilities:\n\n1. **Deep Research**: Answer complex questions with cited evidence from documents\n2. **Document Summarization**: Create structured summaries of papers/reports\n3. **Comparative Analysis**: Compare multiple documents or findings\n4. **Data Extraction**: Extract specific data points, statistics, quotes\n5. **Citation Generation**: Provide proper citations for all claims\n\nAlways:\n- Cite specific documents when making claims (use [Source: filename, chunk X])\n- Structure responses with clear sections\n- Distinguish between facts from documents vs general knowledge\n- Acknowledge when information is not in the knowledge base\n- Provide confidence levels (High/Medium/Low) for answers\n- Format numbers and data clearly\n- Suggest follow-up questions when appropriate\n\nYou have tools to search documents, generate images, run calculations, and fetch web data.",
+          "temperature": 0.2,
+          "maxTokens": 4000
+        }
+      },
+      "id": "node_ai_agent",
+      "name": " GPT-4o Research Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [600, 400],
+      "credentials": { "openAiApi": { "id": "openai_creds", "name": "OpenAI API" } }
+    },
+    {
+      "parameters": {
+        "pineconeIndex": "research-assistant-v2",
+        "topK": 8,
+        "includeMetadata": true,
+        "namespace": "documents",
+        "filter": {
+          "filterValues": []
+        },
+        "options": { "includeValues": false }
+      },
+      "id": "node_pinecone_query",
+      "name": " Pinecone: Semantic Search",
+      "type": "@n8n/n8n-nodes-langchain.toolVectorStore",
+      "typeVersion": 1,
+      "position": [600, 600],
+      "credentials": { "pineconeApi": { "id": "pinecone_creds", "name": "Pinecone API" } },
+      "toolDescription": "Search the research knowledge base for relevant documents. Use this when you need to find information from uploaded research papers, reports, or notes. Input should be a clear semantic query describing what information you need."
+    },
+    {
+      "parameters": {
+        "model": "text-embedding-3-large",
+        "options": { "dimensions": 3072 }
+      },
+      "id": "node_embed_query",
+      "name": " Embed: Query Vector",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOpenAi",
+      "typeVersion": 1.2,
+      "position": [600, 700],
+      "credentials": { "openAiApi": { "id": "openai_creds", "name": "OpenAI API" } }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $json.sessionId }}",
+        "contextWindowLength": 20
+      },
+      "id": "node_memory",
+      "name": "Conversation Memory (Window Buffer)",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [840, 600]
+    },
+    {
+      "parameters": {
+        "name": "web_search",
+        "description": "Search the web for current information not in the knowledge base. Use when documents don't contain the needed information or when you need recent data. Input: a search query string.",
+        "url": "https://api.tavily.com/search",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "api_key", "value": "YOUR_TAVILY_API_KEY" },
+            { "name": "query", "value": "={{ $fromAI('searchQuery', 'The search query') }}" },
+            { "name": "search_depth", "value": "advanced" },
+            { "name": "max_results", "value": 5 }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node_tavily_search",
+      "name": " Tool: Tavily Web Search",
+      "type": "@n8n/n8n-nodes-langchain.toolHttpRequest",
+      "typeVersion": 1.1,
+      "position": [840, 700]
+    },
+    {
+      "parameters": {
+        "name": "generate_chart",
+        "description": "Generate a chart or visualization URL from data. Use when the user asks for visual representation of data. Input: JSON with chart type, labels array, and data array.",
+        "jsCode": "const input = JSON.parse($fromAI('chartData', 'JSON with type, labels, data'));\nconst encoded = encodeURIComponent(JSON.stringify({\n  type: input.type || 'bar',\n  data: {\n    labels: input.labels,\n    datasets: [{ label: input.title || 'Data', data: input.data, backgroundColor: ['#6366f1','#8b5cf6','#a78bfa','#c4b5fd','#818cf8'] }]\n  },\n  options: { plugins: { title: { display: true, text: input.title || 'Chart' } } }\n}));\nreturn { chartUrl: `https://quickchart.io/chart?c=${encoded}&width=600&height=400` };"
+      },
+      "id": "node_chart_tool",
+      "name": " Tool: Generate Charts",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.1,
+      "position": [1080, 600]
+    },
+    {
+      "parameters": {
+        "name": "calculate",
+        "description": "Perform mathematical calculations. Use for statistical analysis, averages, percentages, or any numeric computations. Input: a math expression as string.",
+        "jsCode": "const expr = $fromAI('expression', 'Mathematical expression to evaluate');\ntry {\n  // Safe eval using Function\n  const result = new Function('return ' + expr.replace(/[^0-9+\\-*/().,\\s%Math.]/g, ''))();\n  return { expression: expr, result: result, formatted: result?.toLocaleString() };\n} catch(e) {\n  return { error: 'Could not evaluate: ' + e.message };\n}"
+      },
+      "id": "node_calc_tool",
+      "name": " Tool: Calculator",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.1,
+      "position": [1080, 700]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "schema": { "value": "public", "mode": "list" },
+        "table": { "value": "chat_sessions", "mode": "list" },
+        "where": {
+          "values": [{ "column": "session_id", "value": "={{ $json.sessionId }}" }]
+        },
+        "options": { "queryBatching": "independently" }
+      },
+      "id": "node_load_context",
+      "name": " PostgreSQL: Load Session Context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [320, 600],
+      "credentials": { "postgres": { "id": "postgres_creds", "name": "PostgreSQL DB" } }
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "schema": { "value": "public", "mode": "list" },
+        "table": { "value": "chat_sessions", "mode": "list" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "session_id": "={{ $json.sessionId }}",
+            "user_id": "={{ $json.userId }}",
+            "last_message": "={{ $json.userMessage }}",
+            "last_response": "={{ $json.agentResponse }}",
+            "message_count": "={{ ($json.messageCount || 0) + 1 }}",
+            "updated_at": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": ["session_id"]
+        }
+      },
+      "id": "node_save_session",
+      "name": " PostgreSQL: Save Chat Session",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1320, 400],
+      "credentials": { "postgres": { "id": "postgres_creds", "name": "PostgreSQL DB" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const agentOutput = $input.first().json;\nconst sessionData = $node['🔧 Parse & Validate Request'].json;\n\nconst response = {\n  requestId: sessionData.requestId,\n  sessionId: sessionData.sessionId,\n  userId: sessionData.userId,\n  query: sessionData.userMessage,\n  response: agentOutput.output || agentOutput.text || '',\n  sources: agentOutput.sourceDocuments?.map(d => ({\n    fileName: d.metadata?.fileName,\n    chunkIndex: d.metadata?.chunkIndex,\n    webViewLink: d.metadata?.webViewLink,\n    relevanceScore: d.metadata?.score\n  })) || [],\n  mode: sessionData.mode,\n  timestamp: new Date().toISOString(),\n  processingTimeMs: Date.now() - new Date(sessionData.timestamp).getTime(),\n  metadata: {\n    model: 'gpt-4o',\n    embeddingModel: 'text-embedding-3-large',\n    vectorDimensions: 3072,\n    chunksRetrieved: agentOutput.sourceDocuments?.length || 0\n  }\n};\n\nreturn [{ json: response }];"
+      },
+      "id": "node_format_response",
+      "name": " Format Final Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 400]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              { "name": "Content-Type", "value": "application/json" },
+              { "name": "X-Request-ID", "value": "={{ $json.requestId }}" }
+            ]
+          }
+        }
+      },
+      "id": "node_respond",
+      "name": " Send Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1560, 400]
+    }
+  ],
+  "connections": {
+    " Webhook: Receive Chat Message": { "main": [[{ "node": "🔧 Parse & Validate Request", "type": "main", "index": 0 }]] },
+    " Parse & Validate Request": {
+      "main": [[
+        { "node": " GPT-4o Research Agent", "type": "main", "index": 0 },
+        { "node": " PostgreSQL: Load Session Context", "type": "main", "index": 0 }
+      ]]
+    },
+    " GPT-4o Research Agent": { "main": [[{ "node": " Format Final Response", "type": "main", "index": 0 }]] },
+    " Pinecone: Semantic Search": { "ai_tool": [[{ "node": " GPT-4o Research Agent", "type": "ai_tool", "index": 0 }]] },
+    " Conversation Memory (Window Buffer)": { "ai_memory": [[{ "node": " GPT-4o Research Agent", "type": "ai_memory", "index": 0 }]] },
+    " Tool: Tavily Web Search": { "ai_tool": [[{ "node": " GPT-4o Research Agent", "type": "ai_tool", "index": 0 }]] },
+    " Tool: Generate Charts": { "ai_tool": [[{ "node": " GPT-4o Research Agent", "type": "ai_tool", "index": 0 }]] },
+    " Tool: Calculator": { "ai_tool": [[{ "node": " GPT-4o Research Agent", "type": "ai_tool", "index": 0 }]] },
+    " Format Final Response": { "main": [[{ "node": " PostgreSQL: Save Chat Session", "type": "main", "index": 0 }]] },
+    " PostgreSQL: Save Chat Session": { "main": [[{ "node": " Send Response", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "n8nVersion": "1.70.0"
+  }
+}
