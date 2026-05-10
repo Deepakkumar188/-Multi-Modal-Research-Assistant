@@ -1,0 +1,124 @@
+{
+  "name": " Research Assistant — Analytics & Health Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "hours", "hoursInterval": 1 }] }
+      },
+      "id": "node_hourly_trigger",
+      "name": " Hourly Analytics Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [80, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  COUNT(*) as total_sessions,\n  COUNT(DISTINCT user_id) as unique_users,\n  AVG(message_count) as avg_messages_per_session,\n  SUM(message_count) as total_messages,\n  MAX(updated_at) as last_activity\nFROM chat_sessions\nWHERE updated_at >= NOW() - INTERVAL '24 hours'",
+        "options": {}
+      },
+      "id": "node_session_stats",
+      "name": " Query: Session Statistics",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [320, 200],
+      "credentials": { "postgres": { "id": "postgres_creds", "name": "PostgreSQL DB" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  COUNT(*) as total_documents,\n  SUM(total_chunks) as total_chunks,\n  COUNT(DISTINCT mime_type) as file_types,\n  MAX(processed_at) as last_processed,\n  COUNT(CASE WHEN processed_at >= NOW() - INTERVAL '24 hours' THEN 1 END) as new_today\nFROM document_registry\nWHERE status = 'active'",
+        "options": {}
+      },
+      "id": "node_doc_stats",
+      "name": " Query: Document Statistics",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [320, 400],
+      "credentials": { "postgres": { "id": "postgres_creds", "name": "PostgreSQL DB" } }
+    },
+    {
+      "parameters": {
+        "url": "https://api.pinecone.io/indexes/research-assistant-v2",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "node_pinecone_health",
+      "name": " Pinecone: Index Health Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [320, 600],
+      "credentials": { "httpHeaderAuth": { "id": "pinecone_header_creds", "name": "Pinecone Header Auth" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const sessions = $node[' Query: Session Statistics'].json;\nconst docs = $node['Query: Document Statistics'].json;\nconst pinecone = $node['Pinecone: Index Health Check'].json;\n\nconst report = {\n  reportTime: new Date().toISOString(),\n  health: {\n    status: pinecone.status?.ready ? '✅ Healthy' : '⚠️ Degraded',\n    pineconeVectors: pinecone.status?.vectorCount || 0,\n    pineconeReady: pinecone.status?.ready || false\n  },\n  usage24h: {\n    totalSessions: sessions.total_sessions || 0,\n    uniqueUsers: sessions.unique_users || 0,\n    totalMessages: sessions.total_messages || 0,\n    avgMessagesPerSession: parseFloat(sessions.avg_messages_per_session || 0).toFixed(1),\n    lastActivity: sessions.last_activity\n  },\n  knowledgeBase: {\n    totalDocuments: docs.total_documents || 0,\n    totalChunks: docs.total_chunks || 0,\n    fileTypes: docs.file_types || 0,\n    newToday: docs.new_today || 0,\n    lastProcessed: docs.last_processed\n  }\n};\n\nreturn [{ json: report }];"
+      },
+      "id": "node_compile_report",
+      "name": " Compile Health Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [600, 400]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": " *Research Assistant — Hourly Report*\n\n *System Health*: {{ $json.health.status }}\n• Pinecone Vectors: {{ $json.health.pineconeVectors.toLocaleString() }}\n\n💬 *Usage (24h)*\n• Sessions: {{ $json.usage24h.totalSessions }}\n• Unique Users: {{ $json.usage24h.uniqueUsers }}\n• Total Messages: {{ $json.usage24h.totalMessages }}\n• Avg/Session: {{ $json.usage24h.avgMessagesPerSession }}\n\n📚 *Knowledge Base*\n• Documents: {{ $json.knowledgeBase.totalDocuments }}\n• Chunks: {{ $json.knowledgeBase.totalChunks }}\n• New Today: {{ $json.knowledgeBase.newToday }}\n\n⏰ {{ $json.reportTime }}",
+        "additionalFields": { "parse_mode": "Markdown" }
+      },
+      "id": "node_report_telegram",
+      "name": " Send Report to Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [840, 400],
+      "credentials": { "telegramApi": { "id": "telegram_creds", "name": "Telegram Bot" } }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": { "value": "public", "mode": "list" },
+        "table": { "value": "analytics_logs", "mode": "list" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "report_time": "={{ $json.reportTime }}",
+            "total_sessions": "={{ $json.usage24h.totalSessions }}",
+            "unique_users": "={{ $json.usage24h.uniqueUsers }}",
+            "total_messages": "={{ $json.usage24h.totalMessages }}",
+            "total_documents": "={{ $json.knowledgeBase.totalDocuments }}",
+            "total_chunks": "={{ $json.knowledgeBase.totalChunks }}",
+            "pinecone_vectors": "={{ $json.health.pineconeVectors }}",
+            "system_status": "={{ $json.health.pineconeReady ? 'healthy' : 'degraded' }}"
+          }
+        }
+      },
+      "id": "node_log_analytics",
+      "name": " PostgreSQL: Log Analytics",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [840, 200],
+      "credentials": { "postgres": { "id": "postgres_creds", "name": "PostgreSQL DB" } }
+    }
+  ],
+  "connections": {
+    "⏰ Hourly Analytics Trigger": {
+      "main": [[
+        { "node": " Query: Session Statistics", "type": "main", "index": 0 },
+        { "node": " Query: Document Statistics", "type": "main", "index": 0 },
+        { "node": " Pinecone: Index Health Check", "type": "main", "index": 0 }
+      ]]
+    },
+    " Query: Session Statistics": { "main": [[{ "node": " Compile Health Report", "type": "main", "index": 0 }]] },
+    " Query: Document Statistics": { "main": [[{ "node": " Compile Health Report", "type": "main", "index": 0 }]] },
+    " Pinecone: Index Health Check": { "main": [[{ "node": " Compile Health Report", "type": "main", "index": 0 }]] },
+    " Compile Health Report": {
+      "main": [[
+        { "node": " Send Report to Telegram", "type": "main", "index": 0 },
+        { "node": " PostgreSQL: Log Analytics", "type": "main", "index": 0 }
+      ]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "meta": { "n8nVersion": "1.70.0" }
+}
